@@ -11,14 +11,14 @@ import torch
 
 pytest.importorskip("vllm.v1.hisparse.backend")
 from vllm.v1.kv_cache_interface import (
-    HiSparseHotSpec,
-    HiSparseResidentSpec,
     KVCacheTensor,
     MLAAttentionSpec,
     SparseCacheRole,
     create_kv_cache_views,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+
+from tests.ut.kv_cache_test_utils import is_v033, make_kv_cache_group
 
 from vllm_ascend.attention.indexer import AscendHiSparseIndexerBackend
 from vllm_ascend.attention.sfa_hisparse import (
@@ -289,6 +289,7 @@ def indexer_spec():
     )
 
 
+@pytest.mark.skipif(not is_v033(), reason="KVCacheSpec.merge removed in vLLM #61452")
 @pytest.mark.parametrize("role", [SparseCacheRole.SPARSE, SparseCacheRole.INDEXER])
 def test_indexer_spec_merge_retains_core_cache_role(indexer_spec, role):
     spec = replace(indexer_spec, cache_role=role)
@@ -333,10 +334,22 @@ def test_indexer_page_alignment_preserves_input_specs(indexer_spec, c8):
             cache_sparse_li_c8=True,
         )
         packed_row_bytes = 656
+        if is_v033():
+            from vllm.v1.kv_cache_interface import HiSparseHotSpec, HiSparseResidentSpec
+
+            resident_spec = HiSparseResidentSpec(block_size=128, page_size=128 * 656, block_stride_alignment=128)
+            hot_spec = HiSparseHotSpec(
+                block_size=128, page_size=128 * 656, blocks_per_request=1, block_stride_alignment=128
+            )
+        else:
+            from vllm.v1.kv_cache_interface import HiSparseHotPageSpec, HiSparsePageSpec
+
+            resident_spec = HiSparsePageSpec(block_size=128, page_size=128 * 656, block_stride_alignment=128)
+            hot_spec = HiSparseHotPageSpec(block_size=128, page_size=128 * 656, block_stride_alignment=128)
         specs.update(
             indexer=indexer_spec,
-            resident=HiSparseResidentSpec(block_size=128, page_size=128 * 656, block_stride_alignment=128),
-            hot=HiSparseHotSpec(block_size=128, page_size=128 * 656, blocks_per_request=1, block_stride_alignment=128),
+            resident=resident_spec,
+            hot=hot_spec,
         )
     result = align_hisparse_indexer_specs(specs, packed_row_bytes=packed_row_bytes)
     assert result["source"] is source
@@ -360,7 +373,7 @@ def test_indexer_page_alignment_preserves_input_specs(indexer_spec, c8):
 @pytest.mark.parametrize("field", ["scale_dim", "cache_sparse_li_c8", "cache_sparse_li_c4"])
 def test_unsupported_indexer_formats_are_rejected_before_pool_binding(indexer_spec, field):
     spec = replace(indexer_spec, **{field: 1})
-    config = NS(kv_cache_groups=[NS(layer_names=["indexer"], kv_cache_spec=spec)])
+    config = NS(kv_cache_groups=[make_kv_cache_group(["indexer"], spec)])
     with pytest.raises(ValueError, match="C4|C8|scales"):
         AscendHiSparseBackend().validate_kv_cache_config(config)
 

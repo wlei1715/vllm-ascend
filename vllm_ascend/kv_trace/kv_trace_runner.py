@@ -20,7 +20,7 @@ class _V2RunnerAdapter:
 
     def configure(self) -> None:
         tables = self.runner.block_tables
-        sizes = [group.kv_cache_spec.block_size for group in self.runner.kv_cache_config.kv_cache_groups]
+        sizes = [group.block_size for group in self.runner.kv_cache_config.kv_cache_groups]
         if list(tables.block_sizes) != sizes or list(tables.kernel_block_sizes) != sizes:
             raise ValueError("KV Trace: unadapted MRV2 allocator/kernel block coordinates")
         prepare = self.runner.model_state.prepare_attn

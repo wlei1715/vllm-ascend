@@ -13,18 +13,23 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import get_dp_group, get_pcp_group, get_tp_group, tensor_model_parallel_all_gather
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.utils.math_utils import round_up
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_forward_context import get_mc2_mask, get_mrv2_in_profile_run
-from vllm_ascend.attention.dsa_v41 import AscendDSAV41Metadata, AscendDSAV41MetadataBuilder
+from vllm_ascend.attention.dsa_v41 import (
+    AscendDSAV41Metadata,
+    AscendDSAV41MetadataBuilder,
+    AscendDSAV41StateMetadataBuilder,
+)
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+from vllm_ascend.core.kv_cache_interface import is_circular_cache_group
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 from vllm_ascend.ops.triton.decoder_replay import gather_replay_batch
-from vllm_ascend.utils import should_skip_allreduce_across_dp_group
+from vllm_ascend.utils import should_skip_allreduce_across_dp_group, vllm_version_is
 from vllm_ascend.worker.device_metadata import DeviceMetadataTask
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
@@ -43,6 +48,7 @@ class DecoderReplayInputs:
     encoder_replay_start: torch.Tensor
     pcp_context: "AscendPCPAttentionContext | None" = None
     metadata_producer_stream: torch.npu.Stream | None = None
+    kv_cache_config: KVCacheConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -180,10 +186,19 @@ class DecoderReplayState:
         )
         with set_current_vllm_config(self.config):
             for group_id, groups in enumerate(inputs.attn_groups):
+                if inputs.kv_cache_config is not None and is_circular_cache_group(
+                    inputs.kv_cache_config.kv_cache_groups[group_id]
+                ):
+                    continue
                 for group in groups:
-                    if is_circular_kv_cache_spec(group.kv_cache_spec):
-                        continue
+                    if vllm_version_is("0.33.0"):
+                        from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+
+                        if is_circular_kv_cache_spec(group.kv_cache_spec):
+                            continue
                     builder_cls = group.backend.get_builder_cls()
+                    if issubclass(builder_cls, AscendDSAV41StateMetadataBuilder):
+                        continue
                     if issubclass(builder_cls, AscendDSAV41MetadataBuilder):
                         builder = builder_cls(group.kv_cache_spec, group.layer_names, self.config, self.rows.device)
                         builder.prepare_source_rope()

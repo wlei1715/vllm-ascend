@@ -7,22 +7,26 @@ from dataclasses import replace
 from typing import Any
 
 import torch
-from vllm.v1.kv_cache_interface import (
-    HiSparseHotSpec,
-    HiSparseResidentSpec,
-    KVCacheConfig,
-    KVCacheSpec,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import HiSparseHotSpec, HiSparseResidentSpec
+
+    _HISPARSE_PAGE_SPEC_TYPES: tuple[type, ...] = (HiSparseResidentSpec, HiSparseHotSpec)
+else:
+    from vllm.v1.kv_cache_interface import HiSparsePageSpec
+
+    _HISPARSE_PAGE_SPEC_TYPES = (HiSparsePageSpec,)
 
 
 def align_hisparse_indexer_specs(
-    specs: dict[str, KVCacheSpec],
+    specs: dict[str, Any],
     *,
     packed_row_bytes: int | None = None,
-) -> dict[str, KVCacheSpec]:
+) -> dict[str, Any]:
     """Declare dense indexer-page addressing to Core's shared-slab planner.
 
     Core includes this alignment when sizing each physical device block, before
@@ -31,7 +35,9 @@ def align_hisparse_indexer_specs(
     if packed_row_bytes is not None and packed_row_bytes <= 0:
         raise ValueError("HiSparse packed row width must be positive")
     aligned = {}
-    for name, spec in specs.items():
+    for name, entry in specs.items():
+        has_wrapper = hasattr(entry, "spec") and hasattr(entry, "manager_config")
+        spec = entry.spec if has_wrapper else entry
         alignment = spec.get_block_stride_alignment()
         updates = {}
         if isinstance(spec, AscendSFAIndexerCacheSpec):
@@ -43,13 +49,17 @@ def align_hisparse_indexer_specs(
                 alignment = math.lcm(alignment, spec.head_size, torch.float32.itemsize)
             else:
                 alignment = math.lcm(alignment, spec.page_size_bytes)
-        elif packed_row_bytes is not None and isinstance(spec, (HiSparseResidentSpec, HiSparseHotSpec)):
+        elif packed_row_bytes is not None and isinstance(spec, _HISPARSE_PAGE_SPEC_TYPES):
             # Core derives these synthetic specs without the source row alignment.
             # Declare it before shared-slab sizing, never round runtime addresses.
             alignment = math.lcm(alignment, packed_row_bytes)
         if alignment != spec.get_block_stride_alignment():
             updates["block_stride_alignment"] = alignment
-        aligned[name] = replace(spec, **updates) if updates else spec
+        if updates:
+            updated_spec = replace(spec, **updates)
+            aligned[name] = replace(entry, spec=updated_spec) if has_wrapper else updated_spec
+        else:
+            aligned[name] = entry
     return aligned
 
 
@@ -59,10 +69,7 @@ def get_hisparse_indexer_specs(
     """Collect the Ascend indexer specs keyed by layer."""
     indexer_specs = {}
     for group in kv_cache_config.kv_cache_groups:
-        for name in group.layer_names:
-            spec = group.kv_cache_spec
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                spec = spec.kv_cache_specs[name]
+        for name, spec in group.kv_cache_specs.items():
             if isinstance(spec, AscendSFAIndexerCacheSpec):
                 indexer_specs[name] = spec
 

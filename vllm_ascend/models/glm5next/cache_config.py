@@ -8,42 +8,41 @@ Physical storage uses standard unpacked KV cache descriptors with two page-size
 classes: main MLA/KDA pages and compressed-indexer/tail pages.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from math import lcm
+from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.torch_utils import get_dtype_size
 
 # Both supported versions expose planning helpers in kv_cache_planning.
-from vllm.v1.core.kv_cache_planning import (
-    create_kv_cache_group_specs,
-    may_override_num_blocks,
-)
+from vllm.v1.core.kv_cache_planning import may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
-    KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
 )
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
     AscendMLAAttentionSpec,
+    KVCacheGroup,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
 )
+from vllm_ascend.utils import vllm_version_is
 
 
 @dataclass(frozen=True)
 class _Glm5NextCacheLayout:
-    full_group: KVCacheGroupSpec
-    tail_group: KVCacheGroupSpec
-    mamba_groups: tuple[KVCacheGroupSpec, ...]
-    draft_groups: tuple[KVCacheGroupSpec, ...]
+    full_group: KVCacheGroup
+    tail_group: KVCacheGroup
+    mamba_groups: tuple[KVCacheGroup, ...]
+    draft_groups: tuple[KVCacheGroup, ...]
     mla_names: tuple[str, ...]
     indexer_names: tuple[str, ...]
     tail_names: tuple[str, ...]
@@ -140,8 +139,9 @@ def _align_glm5_next_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]) -> None:
 
 
 def _create_glm5_next_attention_groups(
+    kv_cache_entries: Mapping[str, Any],
     kv_cache_spec: dict[str, KVCacheSpec],
-) -> list[KVCacheGroupSpec]:
+) -> list[KVCacheGroup]:
     """Create the shared full-history group and separate tail group."""
 
     main_names = _sorted_layer_names([name for name, spec in kv_cache_spec.items() if _is_glm5_next_main_spec(spec)])
@@ -193,49 +193,51 @@ def _create_glm5_next_attention_groups(
     full_names = [
         name for main_name, indexer_name in zip(main_names, indexer_names) for name in (main_name, indexer_name)
     ]
-    full_specs = {name: kv_cache_spec[name] for name in full_names}
-    full_uniform_spec = UniformTypeKVCacheSpecs.from_specs(full_specs)
-    if full_uniform_spec is None:
-        raise ValueError(
-            "GLM-Next main MLA and compressed indexer caches must have uniform full-attention block-table semantics."
-        )
+    if vllm_version_is("0.33.0"):
+        from vllm.v1.kv_cache_interface import KVCacheGroupSpec, UniformTypeKVCacheSpecs
 
-    tail_specs = {name: kv_cache_spec[name] for name in tail_names}
-    tail_uniform_spec = UniformTypeKVCacheSpecs.from_specs(tail_specs)
-    if tail_uniform_spec is None:
-        raise ValueError("GLM-Next compressor-tail caches must have uniform fixed-block circular semantics.")
+        full_specs = {name: kv_cache_spec[name] for name in full_names}
+        full_uniform_spec = UniformTypeKVCacheSpecs.from_specs(full_specs)
+        if full_uniform_spec is None:
+            raise ValueError(
+                "GLM-Next main MLA and compressed indexer caches must have uniform full-attention block-table semantics."
+            )
 
-    draft_groups = [KVCacheGroupSpec([name], kv_cache_spec[name]) for name in draft_names]
-    return [
-        KVCacheGroupSpec(full_names, full_uniform_spec),
-        KVCacheGroupSpec(list(tail_names), tail_uniform_spec),
-        *draft_groups,
-    ]
+        tail_specs = {name: kv_cache_spec[name] for name in tail_names}
+        tail_uniform_spec = UniformTypeKVCacheSpecs.from_specs(tail_specs)
+        if tail_uniform_spec is None:
+            raise ValueError("GLM-Next compressor-tail caches must have uniform fixed-block circular semantics.")
+
+        draft_groups = [KVCacheGroupSpec([name], kv_cache_spec[name]) for name in draft_names]
+        return [
+            KVCacheGroupSpec(full_names, full_uniform_spec),
+            KVCacheGroupSpec(list(tail_names), tail_uniform_spec),
+            *draft_groups,
+        ]
+
+    full_group = KVCacheGroup.from_layers({name: kv_cache_entries[name] for name in full_names})
+    tail_group = KVCacheGroup.from_layers({name: kv_cache_entries[name] for name in tail_names})
+    draft_groups = [KVCacheGroup.from_layers({name: kv_cache_entries[name]}) for name in draft_names]
+    return [full_group, tail_group, *draft_groups]
 
 
 def _get_glm5_next_cache_layout(
-    kv_cache_groups: list[KVCacheGroupSpec],
+    kv_cache_groups: list[KVCacheGroup],
 ) -> _Glm5NextCacheLayout | None:
     """Recognize validated GLM-Next groups and derive physical slot counts."""
 
     if not kv_cache_groups:
         return None
 
-    full_groups: list[KVCacheGroupSpec] = []
-    tail_groups: list[KVCacheGroupSpec] = []
-    mamba_groups: list[KVCacheGroupSpec] = []
-    draft_groups: list[KVCacheGroupSpec] = []
+    full_groups: list[KVCacheGroup] = []
+    tail_groups: list[KVCacheGroup] = []
+    mamba_groups: list[KVCacheGroup] = []
+    draft_groups: list[KVCacheGroup] = []
     for group in kv_cache_groups:
-        group_spec = group.kv_cache_spec
-        if isinstance(group_spec, MambaSpec):
+        values = list(group.distinct_specs)
+        if values and all(isinstance(spec, MambaSpec) for spec in values):
             mamba_groups.append(group)
             continue
-        if not isinstance(group_spec, UniformTypeKVCacheSpecs):
-            if not _is_glm5_next_spec(group_spec):
-                draft_groups.append(group)
-            continue
-
-        values = list(group_spec.kv_cache_specs.values())
         if (
             values
             and all(isinstance(spec, MLAAttentionSpec) and _is_glm5_next_spec(spec) for spec in values)
@@ -260,10 +262,7 @@ def _get_glm5_next_cache_layout(
 
     full_group = full_groups[0]
     tail_group = tail_groups[0]
-    assert isinstance(full_group.kv_cache_spec, UniformTypeKVCacheSpecs)
-    assert isinstance(tail_group.kv_cache_spec, UniformTypeKVCacheSpecs)
-    full_specs = full_group.kv_cache_spec.kv_cache_specs
-    tail_specs = tail_group.kv_cache_spec.kv_cache_specs
+    full_specs = full_group.kv_cache_specs
     mla_names = _sorted_layer_names(
         [name for name in full_group.layer_names if _is_glm5_next_main_spec(full_specs[name])]
     )
@@ -282,12 +281,12 @@ def _get_glm5_next_cache_layout(
     # Pipeline-parallel projection keeps empty groups with their global spec.
     # Derive the two canonical page classes from the retained specs, while the
     # slot counts below use only this worker's projected layer names.
-    main_page_sizes = {spec.page_size_bytes for spec in full_specs.values() if _is_glm5_next_main_spec(spec)} | {
-        group.kv_cache_spec.page_size_bytes for group in mamba_groups
+    main_page_sizes = {spec.page_size_bytes for spec in full_group.distinct_specs if _is_glm5_next_main_spec(spec)} | {
+        group.page_size_bytes for group in mamba_groups
     }
-    small_page_sizes = {spec.page_size_bytes for spec in full_specs.values() if _is_glm5_next_indexer_spec(spec)} | {
-        spec.page_size_bytes for spec in tail_specs.values()
-    }
+    small_page_sizes = {
+        spec.page_size_bytes for spec in full_group.distinct_specs if _is_glm5_next_indexer_spec(spec)
+    } | {spec.page_size_bytes for spec in tail_group.distinct_specs}
     if len(main_page_sizes) != 1 or len(small_page_sizes) != 1:
         raise ValueError("GLM-Next cache specs were not aligned to two physical page sizes.")
 
@@ -361,47 +360,54 @@ def _group_glm5_next_mamba_layer_names(
 
 
 def _create_mamba_groups(
-    mamba_specs: dict[str, MambaSpec],
+    mamba_entries: Mapping[str, Any],
     grouped_layer_names: list[list[str]],
-) -> list[KVCacheGroupSpec]:
+) -> list[KVCacheGroup]:
     sorted_groups = [list(_sorted_layer_names(layer_names)) for layer_names in grouped_layer_names]
-    return create_kv_cache_group_specs(mamba_specs, sorted_groups)
+    if vllm_version_is("0.33.0"):
+        from vllm.v1.core.kv_cache_planning import create_kv_cache_group_specs
+
+        return create_kv_cache_group_specs(dict(mamba_entries), sorted_groups)
+    return [KVCacheGroup.from_layers({name: mamba_entries[name] for name in names}) for names in sorted_groups]
 
 
 def get_glm5_next_kv_cache_groups(
     vllm_config: VllmConfig,
-    kv_cache_spec: dict[str, KVCacheSpec],
-) -> list[KVCacheGroupSpec]:
+    kv_cache_spec: Mapping[str, Any],
+) -> list[KVCacheGroup]:
     """Build GLM-Next scheduler groups and align their physical page sizes."""
 
-    if not any(_is_glm5_next_spec(spec) for spec in kv_cache_spec.values()):
+    specs = {name: getattr(entry, "spec", entry) for name, entry in kv_cache_spec.items()}
+    if not any(_is_glm5_next_spec(spec) for spec in specs.values()):
         raise ValueError("Expected GLM-Next cache specs.")
 
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
     if getattr(scheduler_config, "disable_hybrid_kv_cache_manager", False):
         raise ValueError("GLM-Next's paired MLA/indexer and fixed tail layout requires the hybrid KV cache manager.")
 
-    _align_glm5_next_cache_specs(kv_cache_spec)
-    mamba_specs = {name: spec for name, spec in kv_cache_spec.items() if isinstance(spec, MambaSpec)}
-    attention_specs = {name: spec for name, spec in kv_cache_spec.items() if not isinstance(spec, MambaSpec)}
-    groups = _create_glm5_next_attention_groups(attention_specs)
+    _align_glm5_next_cache_specs(specs)
+    mamba_specs = {name: spec for name, spec in specs.items() if isinstance(spec, MambaSpec)}
+    mamba_entries = {name: kv_cache_spec[name] for name in mamba_specs}
+    attention_specs = {name: spec for name, spec in specs.items() if not isinstance(spec, MambaSpec)}
+    attention_entries = {name: kv_cache_spec[name] for name in attention_specs}
+    groups = _create_glm5_next_attention_groups(attention_entries, attention_specs)
     if not mamba_specs:
         # The standalone MTP runner has the same attention/tail pairing but
         # no recurrent groups.
         return groups
 
-    grouped_names = _group_glm5_next_mamba_layer_names(kv_cache_spec, mamba_specs)
-    groups.extend(_create_mamba_groups(mamba_specs, grouped_names))
+    grouped_names = _group_glm5_next_mamba_layer_names(specs, mamba_specs)
+    groups.extend(_create_mamba_groups(mamba_entries, grouped_names))
     return groups
 
 
-def get_glm5_next_pool_bytes_per_block(groups: list[KVCacheGroupSpec]) -> int:
+def get_glm5_next_pool_bytes_per_block(groups: list[KVCacheGroup]) -> int:
     """Return physical bytes represented by one global block ID."""
 
     layout = _get_glm5_next_cache_layout(groups)
     if layout is None:
         raise ValueError("Expected GLM-Next cache groups.")
-    draft_bytes = sum(group.kv_cache_spec.page_size_bytes * len(group.layer_names) for group in layout.draft_groups)
+    draft_bytes = sum(spec.page_size_bytes for group in layout.draft_groups for spec in group.kv_cache_specs.values())
     return (
         layout.main_slot_count * layout.main_page_size + layout.small_slot_count * layout.small_page_size + draft_bytes
     )
@@ -409,7 +415,7 @@ def get_glm5_next_pool_bytes_per_block(groups: list[KVCacheGroupSpec]) -> int:
 
 def get_glm5_next_kv_cache_config(
     vllm_config: VllmConfig,
-    groups: list[KVCacheGroupSpec],
+    groups: list[KVCacheGroup],
     available_memory: int,
 ) -> KVCacheConfig:
     """Describe one standard unpacked tensor per physical cache slot."""
@@ -451,8 +457,8 @@ def get_glm5_next_kv_cache_config(
         )
 
     for group in layout.draft_groups:
-        page_size = group.kv_cache_spec.page_size_bytes
         for layer_name in group.layer_names:
+            page_size = group.kv_cache_specs[layer_name].page_size_bytes
             tensors.append(
                 make_tensor(
                     page_size * num_blocks,

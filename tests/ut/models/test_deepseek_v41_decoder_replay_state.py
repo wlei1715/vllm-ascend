@@ -15,6 +15,7 @@ from vllm_ascend.attention.utils import uses_pcp_sharded_layout
 from vllm_ascend.models.deepseek_v41 import decoder_replay_state as replay_mod
 from vllm_ascend.models.deepseek_v41.decoder_replay_layers import AscendDecoderReplayLayers
 from vllm_ascend.models.deepseek_v41.engram.model_state import EngramModelState
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 
@@ -214,7 +215,8 @@ def test_lazy_decoder_replay_builder_uses_current_config(state, monkeypatch):
             assert get_current_vllm_config() is state.config
             return object
 
-    monkeypatch.setattr(replay_mod, "is_circular_kv_cache_spec", lambda spec: False)
+    if vllm_version_is("0.33.0"):
+        monkeypatch.setattr("vllm_ascend.core.kv_cache_interface.is_circular_kv_cache_spec", lambda spec: False)
     state.slots = None
     group = SimpleNamespace(kv_cache_spec=object(), backend=Backend())
     replay_inputs = inputs()
@@ -240,7 +242,8 @@ def test_decoder_replay_builder_prepares_pcp_rope(state, monkeypatch):
             prepared()
 
     monkeypatch.setattr(replay_mod, "AscendDSAV41MetadataBuilder", Builder)
-    monkeypatch.setattr(replay_mod, "is_circular_kv_cache_spec", lambda spec: False)
+    if vllm_version_is("0.33.0"):
+        monkeypatch.setattr("vllm_ascend.core.kv_cache_interface.is_circular_kv_cache_spec", lambda spec: False)
     state.slots = None
     group = SimpleNamespace(
         kv_cache_spec=object(),

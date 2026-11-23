@@ -15,7 +15,8 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.worker.mamba_utils import (
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
@@ -26,6 +27,7 @@ from vllm.v1.worker.mamba_utils import (
 import vllm_ascend.patch.worker.patch_mamba_utils  # noqa: F401
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
+from vllm_ascend.utils import vllm_version_is
 
 _COPY_FUNCS: MambaStateCopyFuncsByType = {
     MambaAttentionBackendEnum.MAMBA2: (get_conv_copy_spec, get_temporal_copy_spec)
@@ -156,16 +158,31 @@ def _make_states(
 
 
 def _make_kv_cache_config(cfg: _TestConfig, layer_names: list[str]) -> KVCacheConfig:
-    mamba_spec = MambaSpec(
-        block_size=cfg.block_size,
-        shapes=((cfg.conv_width, cfg.conv_inner_dim), (cfg.temporal_state_dim,)),
-        dtypes=(cfg.dtype, cfg.dtype),
-        mamba_cache_mode="all",
-    )
+    if vllm_version_is("0.33.0"):
+        from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+
+        mamba_spec = MambaSpec(
+            block_size=cfg.block_size,
+            shapes=((cfg.conv_width, cfg.conv_inner_dim), (cfg.temporal_state_dim,)),
+            dtypes=(cfg.dtype, cfg.dtype),
+            mamba_cache_mode="all",
+        )
+        group: Any = KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=mamba_spec)
+    else:
+        from vllm.v1.kv_cache_interface import KVCacheGroup
+
+        mamba_spec = MambaSpec(
+            block_size=cfg.block_size,
+            shapes=((cfg.conv_width, cfg.conv_inner_dim), (cfg.temporal_state_dim,)),
+            dtypes=(cfg.dtype, cfg.dtype),
+        )
+        group = KVCacheGroup.from_layers(
+            {name: MambaManager.layer_config(mamba_spec, mamba_cache_mode="all") for name in layer_names}
+        )
     return KVCacheConfig(
         num_blocks=cfg.num_blocks,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=mamba_spec)],
+        kv_cache_groups=[group],
     )
 
 

@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 from torch import Tensor
-from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
+from tests.ut.kv_cache_test_utils import is_v033
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import (
     sparse_kv_offload_manager as manager_module,
 )
@@ -330,7 +330,8 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
             kv_cache_groups=[
                 SimpleNamespace(
                     layer_names=[name],
-                    kv_cache_spec=spec,
+                    kv_cache_specs={name: spec},
+                    block_size=spec.block_size,
                 )
                 for name, spec in specs.items()
             ],
@@ -343,18 +344,26 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
 
     def test_cpu_pool_size_supports_uniform_specs(self):
         specs, _, alignment_reserve = _make_memory_plan_inputs()
-        uniform_specs = UniformTypeKVCacheSpecs(
-            block_size=128,
-            kv_cache_specs=specs,
-        )
+        if is_v033():
+            import vllm_ascend.patch.platform.patch_kv_cache_v033_compat  # noqa: F401
+            from vllm.v1.kv_cache_interface import KVCacheGroupSpec, UniformTypeKVCacheSpecs
+
+            group = KVCacheGroupSpec(
+                layer_names=list(specs),
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=128,
+                    kv_cache_specs=specs,
+                ),
+            )
+        else:
+            group = SimpleNamespace(
+                layer_names=list(specs),
+                kv_cache_specs=specs,
+                block_size=128,
+            )
         kv_cache_config = SimpleNamespace(
             num_blocks=200,
-            kv_cache_groups=[
-                SimpleNamespace(
-                    layer_names=list(specs),
-                    kv_cache_spec=uniform_specs,
-                )
-            ],
+            kv_cache_groups=[group],
         )
 
         self.assertEqual(
@@ -369,7 +378,8 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
             kv_cache_groups=[
                 SimpleNamespace(
                     layer_names=["device.0"],
-                    kv_cache_spec=specs["device.0"],
+                    kv_cache_specs={"device.0": specs["device.0"]},
+                    block_size=specs["device.0"].block_size,
                 )
             ],
         )
@@ -385,7 +395,13 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
         )
         kv_cache_config = SimpleNamespace(
             num_blocks=200,
-            kv_cache_groups=[SimpleNamespace(layer_names=["host.0"], kv_cache_spec=spec)],
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["host.0"],
+                    kv_cache_specs={"host.0": spec},
+                    block_size=spec.block_size,
+                )
+            ],
         )
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(

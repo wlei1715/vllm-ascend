@@ -29,9 +29,12 @@ def initialize_kv_cache(
     kv_cache_config: KVCacheConfig,
     is_profiling: bool = False,
     kv_cache_allocation_context: AbstractContextManager | None = None,
+    extensible: bool = False,
 ) -> None:
     # GPUWorker finalizes the PD interleave before KV cache initialization.
     self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+    if not vllm_version_is("0.33.0"):
+        self.extensible_kv_cache = extensible
     kv_cache_config = upstream.deepcopy(kv_cache_config)
     self.kv_cache_config = kv_cache_config
 
@@ -45,28 +48,13 @@ def initialize_kv_cache(
             getattr(self.model_config.hf_config, "max_source_positions", 0),
         )
 
-    block_sizes = []
-    max_num_blocks_per_group = []
-    slot_mapping_enabled = []
-    dcp_sharded = []
-    for kv_cache_group in kv_cache_config.kv_cache_groups:
-        spec = kv_cache_group.kv_cache_spec
-        block_sizes.append(spec.block_size)
-        layer_spec = spec.first_spec if isinstance(spec, upstream.UniformTypeKVCacheSpecs) else spec
-        slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
-        # vLLM main lets each cache type report whether it is DCP-sharded;
-        dcp_sharded.append(spec.dcp_sharded)
-        # Let each cache type account for CP. Attention KV is DCP-sharded,
-        # while Mamba/GDN recurrent state is replicated across DCP ranks.
-        max_num_blocks = spec.max_num_blocks_per_req(self.vllm_config, block_table_max_model_len)
-        # Preserve each cache type's alignment requirements after applying
-        # its topology-aware block-table width.
-        max_num_blocks = upstream.get_block_table_width(
-            max_num_blocks,
-            spec.block_size,
-            token_alignment=spec.block_table_token_alignment,
-        )
-        max_num_blocks_per_group.append(max_num_blocks)
+    block_sizes = [g.block_size for g in kv_cache_config.kv_cache_groups]
+    slot_mapping_enabled = [g.uses_slot_mapping for g in kv_cache_config.kv_cache_groups]
+    dcp_sharded = [g.dcp_sharded for g in kv_cache_config.kv_cache_groups]
+    max_num_blocks_per_group = [
+        g.block_table_width(self.vllm_config, block_table_max_model_len)
+        for g in kv_cache_config.kv_cache_groups
+    ]
 
     target_attn_layer_names = None
     if isinstance(self.speculator, upstream.DraftModelSpeculator):
@@ -105,8 +93,11 @@ def initialize_kv_cache(
         additional_attn_cg_support=additional_attn_cg_support,
     )
 
-    block_tables_kwargs = {}
-    block_tables_kwargs["dcp_sharded"] = dcp_sharded
+    block_tables_kwargs: dict = {"dcp_sharded": dcp_sharded}
+    if not vllm_version_is("0.33.0"):
+        block_tables_kwargs["sliding_window_reach"] = [
+            g.sliding_window_reach for g in kv_cache_config.kv_cache_groups
+        ]
     self.block_tables = upstream.BlockTables(
         block_sizes=block_sizes,
         max_num_reqs=self.max_num_reqs,
@@ -203,9 +194,12 @@ def initialize_kv_cache(
             kv_cache_allocation_context=kv_cache_allocation_context,
             block_tables=self.block_tables,
         )
+    if not vllm_version_is("0.33.0"):
+        self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
     register_sparse_kv_caches = getattr(self, "_register_sparse_kv_caches", None)
     if register_sparse_kv_caches is not None:
         register_sparse_kv_caches(kv_caches_dict)
+    self.kv_caches_by_layer = kv_caches_dict
     self.kv_caches = [
         tensor
         for cache in kv_caches_dict.values()

@@ -1,5 +1,5 @@
 from copy import copy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any, ClassVar, NamedTuple, TypeVar
 
 import numpy as np
@@ -162,11 +162,13 @@ class AscendMLAAttention(MLAAttention):
 
     supports_pcp_dcp: ClassVar[bool] = True
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> AscendMLAAttentionSpec:
-        """Publish the complete cache demand using the selected execution format."""
-        spec = super().get_kv_cache_spec(vllm_config)
-        if getattr(getattr(vllm_config, "attention_config", None), "hisparse_config", None) is not None:
-            return spec
+    def _build_ascend_mla_spec(
+        self,
+        spec: MLAAttentionSpec,
+        vllm_config: VllmConfig,
+        *,
+        is_draft: bool,
+    ) -> AscendMLAAttentionSpec:
         values = {field.name: getattr(spec, field.name) for field in fields(spec) if field.init}
         model_type = getattr(vllm_config.model_config.hf_text_config, "model_type", None)
         storage_heads = self.num_heads
@@ -185,14 +187,29 @@ class AscendMLAAttention(MLAAttention):
             ),
             cache_sparse_sfa_turboquant=use_sfa_turboquant,
             cache_sparse_sfa_c8=use_sfa_c8,
-            store_on_host=(
-                not (spec.is_draft or self.is_draft_layer) and getattr(self.impl, "store_kv_cache_on_host", False)
-            ),
+            store_on_host=(not (is_draft or self.is_draft_layer) and getattr(self.impl, "store_kv_cache_on_host", False)),
             head_size=head_size,
             dtype=dtype,
             cache_dtype_str=cache_dtype_str,
         )
         return AscendMLAAttentionSpec(**values)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> AscendMLAAttentionSpec:
+        """Publish the complete cache demand using the selected execution format."""
+        spec = super().get_kv_cache_spec(vllm_config)
+        if getattr(getattr(vllm_config, "attention_config", None), "hisparse_config", None) is not None:
+            return spec
+        return self._build_ascend_mla_spec(spec, vllm_config, is_draft=getattr(spec, "is_draft", False))
+
+    def get_kv_cache_config(self, vllm_config: VllmConfig):
+        """Publish the complete cache demand using the selected execution format."""
+        layer_config = super().get_kv_cache_config(vllm_config)
+        if getattr(getattr(vllm_config, "attention_config", None), "hisparse_config", None) is not None:
+            return layer_config
+        return replace(
+            layer_config,
+            spec=self._build_ascend_mla_spec(layer_config.spec, vllm_config, is_draft=layer_config.is_draft),
+        )
 
     def _get_kv_cache_format(self, spec: MLAAttentionSpec) -> tuple[int, torch.dtype, str | None, bool, bool]:
         """Resolve cache dimensions, dtype and SFA flags from the execution format."""
@@ -1336,7 +1353,13 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_module = config.compilation_config.static_forward_context.get(self.layer_name)
         if not isinstance(attn_module, MLAAttention):
             return
-        cache_spec = attn_module.get_kv_cache_spec(config)
+        if vllm_version_is("0.33.0"):
+            cache_spec = attn_module.get_kv_cache_spec(config)
+        else:
+            layer_config = attn_module.get_kv_cache_config(config)
+            if layer_config is None:
+                return
+            cache_spec = layer_config.spec
         if supports_strided_mla_cache(config, attn_module, cache_spec):
             self._prepare_prolog_v3_weights()
 

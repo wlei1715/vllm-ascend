@@ -83,7 +83,8 @@ from vllm.models.step5.nvidia.model import (
     make_layers,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector, wait_for_kv_layer_from_connector
 from vllm_ascend.device.device_op import DeviceOperator
@@ -400,12 +401,25 @@ class AscendStep5DSAAttention(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
         return FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
+        )
+
+    def get_kv_cache_config(self, vllm_config: VllmConfig):
+        return FullAttentionManager.layer_config(
+            AttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+                head_size_v=self.head_dim,
+                dtype=self.kv_cache_torch_dtype,
+            )
         )
 
     def _finish_indexer(

@@ -34,6 +34,7 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
 )
 from vllm.v1.worker.mamba_utils import (
     MambaSpecDecodeGPUContext,
+    get_mamba_group_ids,
     get_mamba_groups,
     preprocess_mamba_align_fused_kernel,
     validate_mamba_state_copy_funcs,
@@ -94,6 +95,17 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         self._layerwise_mamba_copy: _LayerwiseMambaCopyState | None = None
         self._layer_state_ranges: dict[str, tuple[int, int]] | None = None
         self._pending_bulk_copy: tuple[MambaSpecDecodeGPUContext, int, torch.Tensor] | None = None
+        if not hasattr(self, "_mamba_group_ids"):
+            self._mamba_group_ids: list[int] = []
+        if not hasattr(self, "_mamba_spec"):
+            self._mamba_spec: MambaSpec | None = None
+
+    def _get_mamba_group_info(self, kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:
+        if self._mamba_spec is None:
+            mamba_groups = get_mamba_groups(kv_cache_config)
+            self._mamba_group_ids = get_mamba_group_ids(mamba_groups)
+            self._mamba_spec = next(iter(mamba_groups))
+        return self._mamba_group_ids, self._mamba_spec
 
     def _get_layer_state_ranges(self, kv_cache_config: KVCacheConfig) -> dict[str, tuple[int, int]]:
         """Map every mamba layer name to its (start, end) range in the
@@ -101,10 +113,18 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         ``MambaSpecDecodeGPUContext`` (same iteration order as
         ``initialize_from_forward_context``)."""
         if self._layer_state_ranges is None:
-            assert self._mamba_spec is not None
+            mamba_group_ids = (
+                self._mamba_group_ids
+                if self._mamba_group_ids
+                else (
+                    self._mamba_ctx.mamba_group_ids
+                    if self._mamba_ctx is not None
+                    else get_mamba_group_ids(get_mamba_groups(kv_cache_config))
+                )
+            )
             ranges: dict[str, tuple[int, int]] = {}
             idx = 0
-            for mamba_group_id in self._mamba_group_ids:
+            for mamba_group_id in mamba_group_ids:
                 group = kv_cache_config.kv_cache_groups[mamba_group_id]
                 for layer_name in group.layer_names:
                     # Match the per-type rows populated by the existing copy context.
@@ -297,6 +317,14 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             BLOCK_SIZE=_PREPROCESS_BLOCK_SIZE,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
+        replayssm = getattr(ctx, "replayssm", None)
+        if replayssm is not None:
+            replayssm.reset_new_slots(
+                idx_mapping=input_batch.idx_mapping,
+                src_cols=self._mamba_src_col_gpu,
+                dst_cols=self._mamba_state_idx_gpu,
+                num_reqs=num_reqs,
+            )
         if self._prepare_layerwise_mamba_copy(ctx, num_reqs, input_batch.idx_mapping, kv_cache_config):
             # Per-layer copies are executed by the connector right after each
             # layer's KV load finishes (do_mamba_copy_for_layer).

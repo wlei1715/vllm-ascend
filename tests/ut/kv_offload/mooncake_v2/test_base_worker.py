@@ -8,18 +8,27 @@ import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
-    KVCacheGroupSpec,
     MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
 )
 
+from tests.ut.kv_cache_test_utils import (
+    get_group_spec,
+    make_full_attention_layer_config,
+    make_kv_cache_group,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import base_worker
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.stats import MooncakeKVConnectorStats
 
-from .helpers import make_full_spec, make_kv_cache_tensor, make_sfa_indexer_spec, make_sliding_spec
+from .helpers import (
+    make_full_group,
+    make_full_spec,
+    make_kv_cache_tensor,
+    make_sfa_indexer_spec,
+    make_sliding_group,
+)
 
 
 @pytest.mark.parametrize(
@@ -49,7 +58,7 @@ def test_kvpp_publishes_owned_layers_and_mtp(monkeypatch, pcp_rank, tp_rank, tar
             )
             for name, cache in caches.items()
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=names, kv_cache_spec=spec)],
+        kv_cache_groups=[make_kv_cache_group(names, spec)],
     )
     worker.engine_id, worker.te_rpc_port = "producer", 9000
     worker.block_size, worker.side_channel_host, worker.handshake_port = 16, "127.0.0.1", 5000
@@ -67,28 +76,29 @@ def test_kvpp_publishes_owned_layers_and_mtp(monkeypatch, pcp_rank, tp_rank, tar
 
 
 def test_build_spec_mappings_expands_uniform_group_by_layer_spec() -> None:
-    full = make_full_spec()
-    sliding = make_sliding_spec()
-    uniform = UniformTypeKVCacheSpecs(
-        block_size=16,
-        kv_cache_specs={"layer.0": full, "layer.1": sliding},
+    spec_a = make_full_attention_layer_config(
+        block_size=16, num_kv_heads=1, head_size=8, head_size_v=8, dtype=torch.float16
     )
+    spec_b = make_full_attention_layer_config(
+        block_size=16, num_kv_heads=2, head_size=8, head_size_v=8, dtype=torch.float16
+    )
+    group = make_kv_cache_group({"layer.0": spec_a, "layer.1": spec_b})
     worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
-    worker.kv_cache_config = MagicMock(
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer.0", "layer.1"], kv_cache_spec=uniform)]
-    )
+    worker.kv_cache_config = MagicMock(kv_cache_groups=[group])
 
     worker._build_kv_cache_spec_mappings()
 
-    assert worker.kv_cache_specs == [full, sliding]
+    assert worker.kv_cache_specs == [get_group_spec(group, "layer.0"), get_group_spec(group, "layer.1")]
+    assert worker.spec_index_to_group == [group, group]
     assert worker.layer_name_to_group_index == {"layer.0": 0, "layer.1": 0}
     assert worker.layer_name_to_spec_index == {"layer.0": 0, "layer.1": 1}
 
 
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
-@pytest.mark.parametrize("spec_factory", [make_full_spec, make_sliding_spec])
-def test_register_kv_caches_uses_config_order_and_publishes_tensor_metadata(monkeypatch, layout, spec_factory) -> None:
-    spec = spec_factory()
+@pytest.mark.parametrize("group_factory", [make_full_group, make_sliding_group])
+def test_register_kv_caches_uses_config_order_and_publishes_tensor_metadata(monkeypatch, layout, group_factory) -> None:
+    group = group_factory(["layer.0"])
+    spec = get_group_spec(group)
     shape = (4, 1, 16, 8) if layout == "HND" else (4, 16, 1, 8)
     k_cache = torch.empty(shape, dtype=torch.float16)
     v_cache = torch.empty(shape, dtype=torch.float16)
@@ -102,7 +112,7 @@ def test_register_kv_caches_uses_config_order_and_publishes_tensor_metadata(monk
                 block_stride=spec.page_size_bytes,
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=spec)],
+        kv_cache_groups=[group],
     )
     worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
     worker.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=16))
@@ -219,7 +229,7 @@ def test_register_kv_caches_merges_only_full_pages(
                 block_stride=page_bytes,
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=spec)],
+        kv_cache_groups=[make_kv_cache_group(["layer.0"], spec)],
     )
     worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
     worker.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=16))
@@ -309,7 +319,7 @@ def test_register_kv_caches_publishes_raw_slot_for_component_major_mla_views(mon
                 block_stride=slot_elems * raw_cache.element_size(),
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=spec)],
+        kv_cache_groups=[make_kv_cache_group(["layer.0"], spec)],
     )
     worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
     worker.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=16))
@@ -374,7 +384,7 @@ def test_register_kv_caches_publishes_sfa_indexer_virtual_block_size(
                 block_stride=cache.stride(0) * cache.element_size(),
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer.0.indexer"], kv_cache_spec=spec)],
+        kv_cache_groups=[make_kv_cache_group(["layer.0.indexer"], spec)],
     )
     worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
     worker.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=16))
@@ -440,7 +450,7 @@ def sharing_registration(monkeypatch, request):
             )
             for name, binding in caches.items()
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=list(caches), kv_cache_spec=spec)],
+        kv_cache_groups=[make_kv_cache_group(list(caches), spec)],
     )
     worker.engine_id, worker.te_rpc_port = "engine", 9000
     worker.block_size, worker.side_channel_host, worker.handshake_port = 16, "127.0.0.1", 5000
@@ -566,7 +576,7 @@ def test_register_kv_caches_rejects_missing_and_unconfigured_layers() -> None:
                 block_stride=spec.page_size_bytes,
             )
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=spec)],
+        kv_cache_groups=[make_kv_cache_group(["layer.0"], spec)],
     )
     worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
     worker.vllm_config = SimpleNamespace(

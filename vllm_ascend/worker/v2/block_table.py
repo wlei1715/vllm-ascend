@@ -51,6 +51,7 @@ class AscendBlockTables(BlockTables):
         cp_interleave: int = 1,
         slot_mapping_enabled: list[bool] | None = None,
         dcp_sharded: list[bool] | None = None,
+        sliding_window_reach: list[int] | None = None,
     ):
         if kernel_block_sizes is None:
             kernel_block_sizes = block_sizes
@@ -71,9 +72,11 @@ class AscendBlockTables(BlockTables):
         # vLLM main added a per-group ``dcp_sharded`` flag to BlockTables;
         # older releases have no such parameter, so only forward it
         # when the caller supplies it.
-        super_kwargs: dict[str, list[bool]] = {}
+        super_kwargs: dict[str, list[bool] | list[int]] = {}
         if dcp_sharded is not None:
             super_kwargs["dcp_sharded"] = dcp_sharded
+        if sliding_window_reach is not None:
+            super_kwargs["sliding_window_reach"] = sliding_window_reach
         # vLLM main's `BlockTables.__init__` has no `kernel_block_sizes`
         # parameter, so it is not forwarded; the kernel-block layout is
         # maintained here instead.

@@ -99,6 +99,7 @@ from .cache_config import (
     make_folded_index_cache_spec,
     make_index_cache_spec,
     make_mla_cache_spec,
+    make_swa_cache_config,
     make_swa_cache_spec,
     uses_a5_packed_cache,
 )
@@ -779,15 +780,27 @@ class AscendDeepseekV41SWACache(DeepseekV41CacheLayer):
 
     def __init__(self, head_dim, window_size, dtype, prefix, cache_config, bounded_replay=False):
         block_size = cache_config.block_size
-        spec = make_swa_cache_spec(
-            block_size=block_size,
-            window_size=window_size,
-            head_size=head_dim,
-            dtype=dtype,
-            cache_dtype=cache_config.cache_dtype,
-            bounded_replay=bounded_replay,
-        )
-        super().__init__(get_current_vllm_config(), prefix, spec)
+        from vllm_ascend.utils import vllm_version_is
+
+        if vllm_version_is("0.33.0"):
+            target = make_swa_cache_spec(
+                block_size=block_size,
+                window_size=window_size,
+                head_size=head_dim,
+                dtype=dtype,
+                cache_dtype=cache_config.cache_dtype,
+                bounded_replay=bounded_replay,
+            )
+        else:
+            target = make_swa_cache_config(
+                block_size=block_size,
+                window_size=window_size,
+                head_size=head_dim,
+                dtype=dtype,
+                cache_dtype=cache_config.cache_dtype,
+                bounded_replay=bounded_replay,
+            )
+        super().__init__(get_current_vllm_config(), prefix, target)
         self.head_dim = head_dim
         self.window_size = window_size
         self.dtype = dtype

@@ -621,9 +621,12 @@ class TestNPUPlatform(TestBase):
         _validate_draft_decode_context_parallel_config(config)
 
     def test_get_kv_cache_config_builder_cls(self):
-        assert NPUPlatform.get_kv_cache_config_builder_cls(self.mock_vllm_config()) == (
-            "vllm_ascend.core.kv_cache_config_builder.AscendKVCacheConfigBuilder"
+        expected = (
+            "vllm_ascend.core.kv_cache_config_builder_v033.AscendKVCacheConfigBuilder"
+            if vllm_version_is("0.33.0")
+            else "vllm_ascend.core.kv_cache_config_builder.AscendKVCacheConfigBuilder"
         )
+        assert NPUPlatform.get_kv_cache_config_builder_cls(self.mock_vllm_config()) == expected
 
     @patch("vllm_ascend.platform.enable_sp", return_value=False)
     @patch("vllm_ascend.platform.enable_sfa_dcp_replicated_indexer", return_value=True)

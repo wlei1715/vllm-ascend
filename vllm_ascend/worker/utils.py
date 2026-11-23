@@ -4,11 +4,10 @@ from contextlib import contextmanager
 import torch
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.core.single_type_kv_cache_manager import EncoderOnlyAttentionManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    EncoderOnlyAttentionSpec,
     KVCacheConfig,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -163,14 +162,12 @@ def prepare_ascend_kernel_block_sizes(
     # Upstream drops only encoder-only groups, so this index tracks its output.
     index = 0
     for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            spec = next(iter(spec.kv_cache_specs.values()))
-        if isinstance(spec, EncoderOnlyAttentionSpec):
+        if issubclass(group.manager_cls, EncoderOnlyAttentionManager):
             continue
         if index >= len(kernel_block_sizes):
             break
-        manager_block_size = group.kv_cache_spec.block_size
+        spec = group.distinct_specs[0]
+        manager_block_size = group.block_size
         strides = _group_tensor_strides(kv_cache_config, group.layer_names)
         block_outermost_packed = any(0 < layer_stride < block_stride for layer_stride, block_stride in strides)
         aliases_layers = any(layer_stride == 0 and block_stride > 0 for layer_stride, block_stride in strides)

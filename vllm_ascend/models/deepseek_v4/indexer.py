@@ -159,6 +159,11 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             **ratio_kwargs,
         )
 
+    def get_kv_cache_config(self, vllm_config: VllmConfig):
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+        return FullAttentionManager.layer_config(self.get_kv_cache_spec(vllm_config))
+
     def forward(self): ...
 
     def get_attn_backend(self):

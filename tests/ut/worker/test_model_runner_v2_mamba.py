@@ -13,16 +13,20 @@ from vllm.config import AttentionConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
     KVCacheTensor,
     MambaSpec,
-    SlidingWindowSpec,
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
+from tests.ut.kv_cache_test_utils import (
+    get_group_spec,
+    make_full_attention_spec,
+    make_kv_cache_group,
+    make_sliding_window_layer_config,
+)
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
@@ -33,7 +37,6 @@ from vllm_ascend.worker.v2.attn_utils import (
     _align_hybrid_attention_page_sizes,
     _allocate_kv_cache,
     _reshape_kv_cache_v2,
-    get_kv_cache_spec,
 )
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.model_states import init_asecnd_model_state
@@ -108,12 +111,7 @@ def _kv_cache_config(
                 spec.page_size_bytes,
             ),
         ],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=["linear_attn"],
-                kv_cache_spec=spec,
-            )
-        ],
+        kv_cache_groups=[make_kv_cache_group(["linear_attn"], spec)],
     )
 
 
@@ -152,7 +150,7 @@ def _make_defer_state(kv_cache_config):
     state._layerwise_mamba_copy = None
     state._layer_state_ranges = None
     state._mamba_state_copy_funcs = {
-        group.kv_cache_spec.mamba_type: tuple(MagicMock() for _ in group.kv_cache_spec.shapes)
+        get_group_spec(group).mamba_type: tuple(MagicMock() for _ in get_group_spec(group).shapes)
         for group in kv_cache_config.kv_cache_groups
     }
     state._layer_state_ranges = state._get_layer_state_ranges(kv_cache_config)
@@ -169,11 +167,8 @@ def test_layerwise_copy_rows_follow_each_groups_state_types(ple_first):
         mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
     )
     groups = [
-        KVCacheGroupSpec(
-            layer_names=["layers.0.linear_attn", "layers.1.linear_attn"],
-            kv_cache_spec=gdn,
-        ),
-        KVCacheGroupSpec(layer_names=["layers.1.ple"], kv_cache_spec=ple),
+        make_kv_cache_group(["layers.0.linear_attn", "layers.1.linear_attn"], gdn),
+        make_kv_cache_group(["layers.1.ple"], ple),
     ]
     if ple_first:
         groups.reverse()
@@ -834,7 +829,7 @@ def test_mamba_cache_reshape_uses_page_strided_state_tensors(_mock_config):
     ),
 )
 def test_hybrid_cache_exposes_attention_views_and_mamba_states(_mock_config):
-    attention_spec = FullAttentionSpec(
+    attention_spec = make_full_attention_spec(
         block_size=4,
         num_kv_heads=1,
         head_size=1,
@@ -871,14 +866,8 @@ def test_hybrid_cache_exposes_attention_views_and_mamba_states(_mock_config):
         num_blocks=2,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=["full_attn", "mtp_attn"],
-                kv_cache_spec=attention_spec,
-            ),
-            KVCacheGroupSpec(
-                layer_names=["linear_attn"],
-                kv_cache_spec=mamba_spec,
-            ),
+            make_kv_cache_group(["full_attn", "mtp_attn"], attention_spec),
+            make_kv_cache_group(["linear_attn"], mamba_spec),
         ],
     )
     raw_caches = _allocate_kv_cache(
@@ -1003,12 +992,7 @@ def test_attention_cache_reshape_uses_virtual_kernel_block_count(
                     spec.page_size_bytes,
                 ),
             ],
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    layer_names=["mla_attn"],
-                    kv_cache_spec=spec,
-                )
-            ],
+            kv_cache_groups=[make_kv_cache_group(["mla_attn"], spec)],
         ),
     )
 
@@ -1024,22 +1008,34 @@ def test_attention_cache_reshape_uses_virtual_kernel_block_count(
     assert backend.get_kv_cache_shape.call_args.args[0] == num_kernel_blocks
 
 
+def _collect_kv_cache_requirements(vllm_config):
+    if vllm_version_is("0.33.0"):
+        return attn_utils.get_kv_cache_spec(vllm_config)
+    return attn_utils.get_kv_cache_layer_configs(vllm_config)
+
+
 @patch("vllm_ascend.worker.v2.attn_utils.get_layers_from_vllm_config")
 def test_get_kv_cache_spec_keeps_mamba_layers(mock_get_layers):
+    is_v033 = vllm_version_is("0.33.0")
     spec = _mamba_spec()
+    expected_entry = spec if is_v033 else MambaManager.layer_config(spec)
     mamba_layer = MagicMock()
     mamba_layer.kv_sharing_target_layer_name = None
-    mamba_layer.get_kv_cache_spec.return_value = spec
+    if is_v033:
+        mamba_layer.get_kv_cache_spec.return_value = expected_entry
+    else:
+        mamba_layer.get_kv_cache_config.return_value = expected_entry
     mock_get_layers.return_value = {"linear_attn": mamba_layer}
 
-    assert get_kv_cache_spec(_mock_vllm_config()) == {"linear_attn": spec}
+    assert _collect_kv_cache_requirements(_mock_vllm_config()) == {"linear_attn": expected_entry}
 
 
 @patch("vllm_ascend.worker.v2.attn_utils.get_layers_from_vllm_config")
 def test_mamba_spec_follows_aligned_attention_spec(
     mock_get_layers,
 ):
-    attention_spec = FullAttentionSpec(
+    is_v033 = vllm_version_is("0.33.0")
+    attention_spec = make_full_attention_spec(
         block_size=4,
         num_kv_heads=1,
         head_size=1,
@@ -1059,22 +1055,29 @@ def test_mamba_spec_follows_aligned_attention_spec(
         def get_kv_cache_spec(self, _vllm_config):
             return attention_spec
 
+        def get_kv_cache_config(self, _vllm_config):
+            return FullAttentionManager.layer_config(attention_spec)
+
         def get_attn_backend(self):
             return _FakeAttentionBackend
 
     mamba_layer = MagicMock()
     mamba_layer.kv_sharing_target_layer_name = None
-    mamba_layer.get_kv_cache_spec.return_value = mamba_spec
+    if is_v033:
+        mamba_layer.get_kv_cache_spec.return_value = mamba_spec
+    else:
+        mamba_layer.get_kv_cache_config.return_value = MambaManager.layer_config(mamba_spec)
     mock_get_layers.return_value = {
         "linear_attn": mamba_layer,
         "full_attn": FakeAttention(),
     }
 
-    specs = get_kv_cache_spec(_mock_vllm_config())
+    entries = _collect_kv_cache_requirements(_mock_vllm_config())
+    full_spec = getattr(entries["full_attn"], "spec", entries["full_attn"])
 
-    assert list(specs) == ["full_attn", "linear_attn"]
-    assert specs["full_attn"].page_size_bytes == 20
-    assert specs["full_attn"].page_size_padded == 20
+    assert list(entries) == ["full_attn", "linear_attn"]
+    assert full_spec.page_size_bytes == 20
+    assert full_spec.page_size_padded == 20
 
 
 @pytest.mark.parametrize("include_mamba", [False, True])
@@ -1083,13 +1086,14 @@ def test_get_kv_cache_spec_rejects_nondivisible_hybrid_attention_pages(
     mock_get_layers,
     include_mamba,
 ):
-    small_attention_spec = FullAttentionSpec(
+    is_v033 = vllm_version_is("0.33.0")
+    small_attention_spec = make_full_attention_spec(
         block_size=4,
         num_kv_heads=1,
         head_size=3,
         dtype=torch.float16,
     )
-    large_attention_spec = FullAttentionSpec(
+    large_attention_spec = make_full_attention_spec(
         block_size=4,
         num_kv_heads=1,
         head_size=5,
@@ -1115,12 +1119,18 @@ def test_get_kv_cache_spec_rejects_nondivisible_hybrid_attention_pages(
         def get_kv_cache_spec(self, _vllm_config):
             return self.spec
 
+        def get_kv_cache_config(self, _vllm_config):
+            return FullAttentionManager.layer_config(self.spec)
+
         def get_attn_backend(self):
             return _FakeAttentionBackend
 
     mamba_layer = MagicMock()
     mamba_layer.kv_sharing_target_layer_name = None
-    mamba_layer.get_kv_cache_spec.return_value = mamba_spec
+    if is_v033:
+        mamba_layer.get_kv_cache_spec.return_value = mamba_spec
+    else:
+        mamba_layer.get_kv_cache_config.return_value = MambaManager.layer_config(mamba_spec)
     mock_get_layers.return_value = {
         "small_attn": FakeAttention(small_attention_spec),
         "linear_attn": mamba_layer,
@@ -1129,11 +1139,12 @@ def test_get_kv_cache_spec_rejects_nondivisible_hybrid_attention_pages(
 
     if include_mamba:
         with pytest.raises(ValueError, match="Cannot align hybrid attention K/V pages for small_attn"):
-            get_kv_cache_spec(_mock_vllm_config())
+            _collect_kv_cache_requirements(_mock_vllm_config())
     else:
         del mock_get_layers.return_value["linear_attn"]
         # Non-hybrid allocation does not use the shared Attention/Mamba layout.
-        specs = get_kv_cache_spec(_mock_vllm_config())
+        entries = _collect_kv_cache_requirements(_mock_vllm_config())
+        specs = {name: getattr(entry, "spec", entry) for name, entry in entries.items()}
         assert specs == {"small_attn": small_attention_spec, "large_attn": large_attention_spec}
 
 
@@ -1144,9 +1155,10 @@ def test_hybrid_dflash_writes_preserve_other_request_blocks(
     monkeypatch, full_block_size, draft_num_kv_heads, padded_sliding
 ):
     """Draft writes must not alias another block ID in target attention or GDN."""
-    full = FullAttentionSpec(block_size=full_block_size, num_kv_heads=1, head_size=2, dtype=torch.bfloat16)
+    is_v033 = vllm_version_is("0.33.0")
+    full = make_full_attention_spec(block_size=full_block_size, num_kv_heads=1, head_size=2, dtype=torch.bfloat16)
     padded_page_size = full.real_page_size_bytes + 64
-    sliding = SlidingWindowSpec(
+    sliding_entry = make_sliding_window_layer_config(
         block_size=128,
         num_kv_heads=draft_num_kv_heads,
         head_size=1,
@@ -1161,10 +1173,19 @@ def test_hybrid_dflash_writes_preserve_other_request_blocks(
         dtypes=(torch.bfloat16, torch.float32),
         page_size_padded=padded_page_size,
     )
-    draft_full = FullAttentionSpec(
-        block_size=full_block_size, num_kv_heads=draft_num_kv_heads, head_size=1, dtype=torch.bfloat16, non_causal=True
+    draft_full = make_full_attention_spec(
+        block_size=full_block_size,
+        num_kv_heads=draft_num_kv_heads,
+        head_size=1,
+        dtype=torch.bfloat16,
+        **({"non_causal": True} if is_v033 else {}),
     )
-    original_specs = {"target.full": full, "draft.sliding": sliding, "draft.full": draft_full, "target.gdn": mamba}
+    original_entries = {
+        "target.full": full if is_v033 else FullAttentionManager.layer_config(full),
+        "draft.sliding": sliding_entry,
+        "draft.full": draft_full if is_v033 else FullAttentionManager.layer_config(draft_full),
+        "target.gdn": mamba if is_v033 else MambaManager.layer_config(mamba),
+    }
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         attention_config=AttentionConfig(indexer_kv_dtype="int8"),
@@ -1176,16 +1197,18 @@ def test_hybrid_dflash_writes_preserve_other_request_blocks(
     layers = {
         name: SimpleNamespace(
             is_draft_layer=name.startswith("draft."),
-            get_kv_cache_spec=lambda _config, spec=spec: spec,
+            get_kv_cache_spec=lambda _config, entry=entry: entry,
+            get_kv_cache_config=lambda _config, entry=entry: entry,
             get_attn_backend=lambda: _FakeAttentionBackend,
         )
-        for name, spec in original_specs.items()
+        for name, entry in original_entries.items()
     }
     monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args: layers)
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda _config: False)
     monkeypatch.setattr(attn_utils, "enable_fa_quant", lambda _config: False)
-    specs = get_kv_cache_spec(config)
+    entries = _collect_kv_cache_requirements(config)
+    specs = {name: getattr(entry, "spec", entry) for name, entry in entries.items()}
     num_blocks = 8
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -1198,7 +1221,7 @@ def test_hybrid_dflash_writes_preserve_other_request_blocks(
             )
             for name, spec in specs.items()
         ],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec) for name, spec in specs.items()],
+        kv_cache_groups=[make_kv_cache_group([name], entry) for name, entry in entries.items()],
     )
     backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d, _dtype: (2, n, b, h, d))
     groups = [
@@ -1229,21 +1252,26 @@ def test_hybrid_dflash_writes_preserve_other_request_blocks(
                 other_blocks = torch.arange(num_blocks) != block_id
                 for target_cache, expected in zip(target_caches, before):
                     torch.testing.assert_close(target_cache[other_blocks], expected[other_blocks])
-    assert specs["draft.sliding"].sliding_window == sliding.sliding_window
-    assert specs["draft.sliding"].extra_retained_tokens == sliding.extra_retained_tokens
+    if is_v033:
+        assert specs["draft.sliding"].sliding_window == sliding_entry.sliding_window
+        assert specs["draft.sliding"].extra_retained_tokens == sliding_entry.extra_retained_tokens
+        assert specs["draft.full"].non_causal is True
+    else:
+        assert entries["draft.sliding"].manager_config.params.sliding_window == 4096
+        assert entries["draft.sliding"].manager_config.params.extra_retained_tokens == 15
     assert specs["draft.sliding"].block_size == full_block_size * 2 // draft_num_kv_heads
     assert specs["draft.full"].block_size == specs["draft.sliding"].block_size
-    assert specs["draft.full"].non_causal is True
     assert specs["target.gdn"] == mamba
-    assert sliding.block_size == 128
+    assert getattr(sliding_entry, "spec", sliding_entry).block_size == 128
 
 
 def test_hybrid_attention_alignment_rejects_different_k_v_proportions():
-    full = FullAttentionSpec(block_size=128, num_kv_heads=1, head_size=2, dtype=torch.float16)
+    full = make_full_attention_spec(block_size=128, num_kv_heads=1, head_size=2, dtype=torch.float16)
     # Equal total page sizes still do not make the K and V segments compatible.
-    sliding = SlidingWindowSpec(
+    sliding_entry = make_sliding_window_layer_config(
         block_size=128, num_kv_heads=1, head_size=1, head_size_v=3, dtype=torch.float16, sliding_window=4096
     )
+    sliding = getattr(sliding_entry, "spec", sliding_entry)
     assert full.real_page_size_bytes == sliding.real_page_size_bytes
     with pytest.raises(ValueError, match="matching K/V size ratios"):
         _align_hybrid_attention_page_sizes({"full": full, "sliding": sliding})
