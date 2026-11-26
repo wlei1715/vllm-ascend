@@ -293,7 +293,19 @@ def _patch_eplb_policy_config() -> None:
     decorators = getattr(config_cls, "__pydantic_decorators__", None)
     validator = None if decorators is None else decorators.model_validators.get("_validate_eplb_config")
     if validator is None:
-        raise RuntimeError("Unsupported vLLM EPLB contract: policy validator is missing.")
+        # vllm main after the EPLB policy refactor: `policy` is typed
+        # `EPLBPolicyOption | str | None` and is validated by the platform's
+        # check_and_update_eplb_config() instead of a config model validator.
+        # "stair" is already accepted as a plain str, and the platform
+        # default (None -> "default") stays valid for the base platform
+        # check, so there is nothing to wrap here. Restoring "stair" as the
+        # Ascend default would additionally require overriding
+        # check_and_update_eplb_config on the NPU platform.
+        logger.info(
+            "EPLB policy validator not found (vllm main contract); "
+            "keeping the upstream policy field unchanged."
+        )
+        return
     original_validator = validator.func
 
     @wraps(original_validator)
@@ -820,13 +832,22 @@ def _patch_changed_layer_transfer() -> None:
 
 def _wrap_move_to_workspace(original_move):
     move_signature = signature(original_move)
-    if not {"model_state", "ep_rank"}.issubset(move_signature.parameters):
+    # vllm main moved _move_to_workspace from a module-level function taking
+    # ``model_state`` into a method on ``EplbModelState`` (where the model
+    # state is ``self``). Support both shapes.
+    if "ep_rank" not in move_signature.parameters:
+        raise RuntimeError("Unsupported vLLM EPLB contract: async workspace move signature changed.")
+    if "model_state" in move_signature.parameters:
+        model_state_param = "model_state"
+    elif "self" in move_signature.parameters:
+        model_state_param = "self"
+    else:
         raise RuntimeError("Unsupported vLLM EPLB contract: async workspace move signature changed.")
 
     @wraps(original_move)
     def _move_to_workspace(*args, **kwargs):
         bound = move_signature.bind(*args, **kwargs)
-        model_state = bound.arguments["model_state"]
+        model_state = bound.arguments[model_state_param]
         pending_result = model_state.pending_result
         layer_idx = pending_result.layer_idx if pending_result is not None else None
         is_last_result = (
@@ -897,7 +918,15 @@ def _wrap_move_to_workspace(original_move):
 
 
 def _patch_async_move_to_workspace() -> None:
-    original_move = _eplb_state._move_to_workspace
+    # vllm main: method on EplbModelState; older vllm: module-level function.
+    class_move = getattr(getattr(_eplb_state, "EplbModelState", None), "_move_to_workspace", None)
+    if class_move is not None:
+        if not getattr(class_move, _PATCH_MARKER, False):
+            _eplb_state.EplbModelState._move_to_workspace = _wrap_move_to_workspace(class_move)
+        return
+    original_move = getattr(_eplb_state, "_move_to_workspace", None)
+    if original_move is None:
+        raise RuntimeError("Unsupported vLLM EPLB contract: async workspace move entry point is missing.")
     if not getattr(original_move, _PATCH_MARKER, False):
         _eplb_state._move_to_workspace = _wrap_move_to_workspace(original_move)
 
