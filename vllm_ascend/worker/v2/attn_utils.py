@@ -301,7 +301,7 @@ def _collect_cache_requirements(vllm_config: VllmConfig) -> dict[str, Any]:
             continue
         if isinstance(spec, AttentionSpec):
             # Match upstream customization, including kernel-block stride alignment.
-            spec = customize_attention_spec(attn_module.get_attn_backend(), spec)
+            spec = customize_attention_spec(attn_module.get_attn_backend(), spec, layer_name)
         is_plain_full = (
             type(spec) is FullAttentionSpec
             if is_v033
