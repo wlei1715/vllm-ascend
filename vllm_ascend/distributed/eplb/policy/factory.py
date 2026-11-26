@@ -7,8 +7,15 @@ from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
 
 
-def create_eplb_policy(policy: str, stair_config: StairConfig) -> AbstractEplbPolicy:
-    """Create the configured Ascend EPLB policy."""
+def create_eplb_policy(policy: str | None, stair_config: StairConfig) -> AbstractEplbPolicy:
+    """Create the configured Ascend EPLB policy.
+
+    ``None`` selects the Ascend default ("stair"): vllm main after the EPLB
+    policy refactor leaves the platform default unset (None) in the config
+    and validates it on the platform instead, so resolve it here.
+    """
+    if policy is None:
+        policy = "stair"
     if policy == "default":
         return DefaultEplbPolicy()
     if policy == "stair":
