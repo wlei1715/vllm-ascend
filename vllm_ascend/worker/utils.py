@@ -4,7 +4,6 @@ from contextlib import contextmanager
 import torch
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.core.single_type_kv_cache_manager import EncoderOnlyAttentionManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -159,12 +158,11 @@ def prepare_ascend_kernel_block_sizes(
     """
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
-    # Upstream drops only encoder-only groups, so this index tracks its output.
-    index = 0
+    # vllm main keeps every group in prepare_kernel_block_sizes' output
+    # (the encoder-only drop and EncoderOnlyAttentionManager are gone), so
+    # iterate the groups 1:1 with its output.
     for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
-        if issubclass(group.manager_cls, EncoderOnlyAttentionManager):
-            continue
-        if index >= len(kernel_block_sizes):
+        if group_id >= len(kernel_block_sizes):
             break
         spec = group.distinct_specs[0]
         manager_block_size = group.block_size
@@ -176,16 +174,15 @@ def prepare_ascend_kernel_block_sizes(
             and isinstance(spec, AttentionSpec)
             and aliases_layers
             and not block_outermost_packed
-            and kernel_block_sizes[index] == manager_block_size
+            and kernel_block_sizes[group_id] == manager_block_size
             and group_id < len(attn_groups)
             and attn_groups[group_id]
         ):
-            kernel_block_sizes[index] = select_common_block_size(
+            kernel_block_sizes[group_id] = select_common_block_size(
                 manager_block_size,
                 [attn_group.backend for attn_group in attn_groups[group_id]],
                 [attn_group.kv_cache_spec for attn_group in attn_groups[group_id]],
             )
-        index += 1
     return kernel_block_sizes
 
 
