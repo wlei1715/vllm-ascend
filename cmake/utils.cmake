@@ -14,7 +14,8 @@ function (run_python OUT EXPR ERR_MSG)
   if(NOT PYTHON_ERROR_CODE EQUAL 0)
     message(FATAL_ERROR "${ERR_MSG}: ${PYTHON_STDERR}")
   endif()
-  set(${OUT} ${PYTHON_OUT} PARENT_SCOPE)
+  string(REGEX MATCH "[^\r\n]+" PYTHON_FIRST_LINE "${PYTHON_OUT}")
+  set(${OUT} ${PYTHON_FIRST_LINE} PARENT_SCOPE)
 endfunction()
 
 # Run `EXPR` in python after importing `PKG`. Use the result of this to extend
