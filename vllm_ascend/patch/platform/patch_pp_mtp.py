@@ -70,21 +70,34 @@ def _patch_model_runner_output() -> None:
     fields = getattr(model_runner_output_cls, "__dataclass_fields__", {})
     if "spec_token_ids" not in fields:
         model_runner_output_cls.spec_token_ids = None
+        # vllm main declares ModelRunnerOutput with @dataclass(slots=True):
+        # instances have no __dict__, so per-instance attribute injection via
+        # a patched __init__ raises "attribute is read-only". With slots the
+        # class-level default above is all we can provide; readers use
+        # getattr(..., "spec_token_ids", None) and degrade gracefully.
+        is_slotted = "__slots__" in getattr(model_runner_output_cls, "__dict__", {})
         original_init = model_runner_output_cls.__init__
-        if getattr(original_init, "_vllm_ascend_pp_mtp_patched", False):
-            return
+        if not is_slotted and not getattr(original_init, "_vllm_ascend_pp_mtp_patched", False):
 
-        @wraps(original_init)
-        def _patched_init(self, *args, spec_token_ids=None, **kwargs):
-            original_init(self, *args, **kwargs)
-            self.spec_token_ids = spec_token_ids
+            @wraps(original_init)
+            def _patched_init(self, *args, spec_token_ids=None, **kwargs):
+                original_init(self, *args, **kwargs)
+                self.spec_token_ids = spec_token_ids
 
-        _patched_init._vllm_ascend_pp_mtp_patched = True  # type: ignore[attr-defined]
-        model_runner_output_cls.__init__ = _patched_init
+            _patched_init._vllm_ascend_pp_mtp_patched = True  # type: ignore[attr-defined]
+            model_runner_output_cls.__init__ = _patched_init
+        if is_slotted:
+            logger.info(
+                "ModelRunnerOutput is slotted in this vLLM revision; "
+                "PP+MTP spec_token_ids pass-through is unavailable."
+            )
 
     empty_output = outputs_mod.EMPTY_MODEL_RUNNER_OUTPUT
     if not hasattr(empty_output, "spec_token_ids"):
-        empty_output.spec_token_ids = None
+        try:
+            empty_output.spec_token_ids = None
+        except AttributeError:
+            pass
 
 
 def _patch_engine_core() -> None:
