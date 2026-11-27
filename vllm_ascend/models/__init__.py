@@ -143,3 +143,10 @@ def register_model():
         "Step5MTP",
         "vllm_ascend.models.step5.mtp:AscendStep5MTP",
     )
+    # Inkling2 (Ascend 910B): the NPU branch lives here, per the upstream
+    # convention that platform implementations belong in vllm-ascend (see
+    # `vllm_ascend/models/inkling2/`).  Text-only, TP=1.
+    ModelRegistry.register_model(
+        "Inkling2LoopForConditionalGeneration",
+        "vllm_ascend.models.inkling2.loop:Inkling2LoopForConditionalGeneration",
+    )
