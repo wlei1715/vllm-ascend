@@ -203,7 +203,7 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
 
     With a `prefix` (engine mode) the layer registers itself in the
     static forward context and answers the v1 engine's per-layer KV
-    cache queries (`get_kv_cache_config` / `get_attn_backend`), so the
+    cache queries (`get_kv_cache_spec` / `get_attn_backend`), so the
     v1 allocator sizes and binds a paged cache for it.  This round the
     compute still runs over the self-managed per-pass tensor caches
     (`_kv`/`_kpos`, validated in round 3); reading the engine's paged
@@ -332,15 +332,15 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
 
         return Inkling2NpuAttentionBackend
 
-    def get_kv_cache_config(self, vllm_config):
+    def get_kv_cache_spec(self, vllm_config):
+        # r198 baseline pairs vllm v0.34.0 (pre-#61452 layout): the engine
+        # queries layers via ``get_kv_cache_spec`` returning a KVCacheSpec,
+        # not the post-#61452 ``get_kv_cache_config``/KVCacheLayerConfig API
+        # the original port was written against.
         from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-        from vllm.v1.core.single_type_kv_cache_manager import (
-            FullAttentionManager,
-            SlidingWindowManager,
-        )
-        from vllm.v1.kv_cache_interface import AttentionSpec
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
-        spec = AttentionSpec(
+        common = dict(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
@@ -350,10 +350,8 @@ class Inkling2NpuAttention(nn.Module, AttentionLayerBase):
             ),
         )
         if self.window is not None:
-            return SlidingWindowManager.layer_config(
-                spec, sliding_window=self.window
-            )
-        return FullAttentionManager.layer_config(spec)
+            return SlidingWindowSpec(sliding_window=self.window, **common)
+        return FullAttentionSpec(**common)
 
     def reset_state(self) -> None:
         self._kv.clear()
